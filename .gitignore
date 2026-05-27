@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# OAuth tokens and local runtime output
+state/*.json
+state/*.db
+output/
+
+# Local macOS/editor noise
+.DS_Store
+.idea/
+.vscode/
