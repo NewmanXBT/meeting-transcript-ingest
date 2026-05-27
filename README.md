@@ -150,7 +150,7 @@ python scripts/meeting_ingest.py lark-import "MINUTES_URL_OR_TOKEN" \
 
 ## Automatic Execution
 
-The tool can run automatically on macOS through `launchd`. The installed job runs one import cycle every five minutes.
+The tool can run automatically on macOS through `launchd`. The installed job runs one import cycle every hour.
 
 Install the automatic job:
 
@@ -184,7 +184,7 @@ The automatic runner executes:
 python scripts/meeting_ingest.py --env-file .env daemon-run --once
 ```
 
-Each cycle does three things:
+Each hourly cycle does three things:
 
 1. Searches Lark/Feishu Minutes for recent transcript records and imports unseen transcripts.
 2. Best-effort checks Google Meet transcripts when an existing Google OAuth token is present.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LABEL="${LABEL:-com.zerodrift.meeting-transcript-ingest}"
-INTERVAL_SECONDS="${INTERVAL_SECONDS:-300}"
+INTERVAL_SECONDS="${INTERVAL_SECONDS:-3600}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$REPO_ROOT/scripts/run_daemon_once.sh"
