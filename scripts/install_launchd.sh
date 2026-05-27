@@ -37,6 +37,8 @@ cat > "$PLIST" <<PLIST
   <dict>
     <key>PATH</key>
     <string>$HOME/.npm-global/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LARK_CLI_NO_PROXY</key>
+    <string>1</string>
   </dict>
 </dict>
 </plist>

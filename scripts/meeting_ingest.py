@@ -242,7 +242,13 @@ def run_lark_cli_json(args: List[str], *, timeout: int = 120) -> Dict[str, Any]:
         raise IngestError(f"lark-cli returned non-JSON output: {output[:1000]}") from exc
 
 
-def run_lark_cli_file(args: List[str], output_path: Path, *, timeout: int = 180) -> bytes:
+def run_lark_cli_file(
+    args: List[str],
+    output_path: Path,
+    *,
+    cwd: Optional[Path] = None,
+    timeout: int = 180,
+) -> bytes:
     completed = subprocess.run(
         lark_cli_base_args() + args,
         check=False,
@@ -250,6 +256,7 @@ def run_lark_cli_file(args: List[str], output_path: Path, *, timeout: int = 180)
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
+        cwd=str(cwd) if cwd else None,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
@@ -677,7 +684,9 @@ def import_lark(args: argparse.Namespace) -> Path:
     if should_use_lark_cli():
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
-                output_path = Path(tmp_dir) / f"{token}.{args.file_format}"
+                tmp_path = Path(tmp_dir)
+                output_name = f"{token}.{args.file_format}"
+                output_path = tmp_path / output_name
                 raw = run_lark_cli_file(
                     [
                         "api",
@@ -694,9 +703,10 @@ def import_lark(args: argparse.Namespace) -> Path:
                             }
                         ),
                         "--output",
-                        str(output_path),
+                        output_name,
                     ],
                     output_path,
+                    cwd=tmp_path,
                 )
         except IngestError:
             if os.environ.get("LARK_BACKEND", "auto").lower() == "cli":
@@ -1012,7 +1022,8 @@ def auto_import_lark(args: argparse.Namespace, state: Dict[str, Any]) -> int:
         except IngestError as exc:
             print(f"[auto] Lark import failed for {token}: {exc}")
             continue
-        remember(state, "seen_lark_minutes", token)
+        if not args.dry_run:
+            remember(state, "seen_lark_minutes", token)
         imported += 1
         print(f"[auto] imported Lark/Feishu minute {token}: {output or 'dry-run'}")
     return imported
@@ -1093,7 +1104,8 @@ def auto_import_google(args: argparse.Namespace, state: Dict[str, Any]) -> int:
             except Exception as exc:
                 print(f"[auto] Google import failed for {transcript_name}: {exc}")
                 continue
-            remember(state, "seen_google_transcripts", transcript_name)
+            if not args.dry_run:
+                remember(state, "seen_google_transcripts", transcript_name)
             imported += 1
             print(f"[auto] imported Google transcript {transcript_name}: {output or 'dry-run'}")
     return imported
@@ -1124,7 +1136,6 @@ def process_inbox(args: argparse.Namespace, state: Dict[str, Any]) -> int:
             continue
         if args.dry_run:
             print(f"[dry-run] would process inbox file {path}")
-            seen_files[key] = current
             processed += 1
             continue
         try:
