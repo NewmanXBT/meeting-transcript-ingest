@@ -144,14 +144,113 @@ python scripts/meeting_ingest.py lark-import "MINUTES_URL_OR_TOKEN" \
 ~/Documents/Obsidian Vault/ZeroDrift Wiki/raw/internal
 ```
 
+## Automatic Execution
+
+The tool can run automatically on macOS through `launchd`. The installed job runs one import cycle every five minutes.
+
+Install the automatic job:
+
+```bash
+cd ~/meeting-transcript-ingest
+./scripts/install_launchd.sh
+```
+
+Check status:
+
+```bash
+./scripts/launchd_status.sh
+```
+
+Uninstall:
+
+```bash
+./scripts/uninstall_launchd.sh
+```
+
+Logs are written to:
+
+```text
+logs/daemon.out.log
+logs/daemon.err.log
+```
+
+The automatic runner executes:
+
+```bash
+python scripts/meeting_ingest.py --env-file .env daemon-run --once
+```
+
+Each cycle does three things:
+
+1. Searches Lark/Feishu Minutes for recent transcript records and imports unseen transcripts.
+2. Best-effort checks Google Meet transcripts when an existing Google OAuth token is present.
+3. Processes files under `inbox/`.
+
+The daemon deduplicates imported items through:
+
+```text
+state/daemon-state.json
+```
+
+### Inbox Automation
+
+Drop transcript or audio files into:
+
+```text
+inbox/
+```
+
+Supported transcript files:
+
+```text
+.txt .md .vtt .srt .tsv
+```
+
+Supported audio files:
+
+```text
+.mp3 .mp4 .mpeg .mpga .m4a .wav .webm
+```
+
+Audio files are transcribed with `mlx_whisper` by default. Set `AUDIO_ENGINE=openai` in `.env` to use `gpt-4o-transcribe`.
+
+### One-Shot Daemon Test
+
+Run one cycle without writing anything:
+
+```bash
+python scripts/meeting_ingest.py daemon-run --once --dry-run
+```
+
+Run one real cycle:
+
+```bash
+python scripts/meeting_ingest.py daemon-run --once
+```
+
+Useful `.env` settings:
+
+```bash
+LARK_REGION=feishu
+LARK_QUERY=
+LOOKBACK_HOURS=72
+LARK_PAGE_SIZE=20
+GOOGLE_AUTO=1
+GOOGLE_PAGE_SIZE=20
+MEETING_INBOX_DIR="./inbox"
+AUDIO_ENGINE=mlx
+MLX_WHISPER_MODEL="mlx-community/whisper-large-v3-turbo"
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe
+```
+
 ## Automation Roadmap
 
-The first reliable layer is manual/API import. The next layer is event-driven automation:
+The current automatic layer is a local poller/scheduler. The next layer is event-driven automation:
 
 1. Subscribe to Google Meet transcript `fileGenerated` events through Google Workspace Events API and Pub/Sub.
-2. Poll or search Lark/Feishu Minutes for newly created transcript records.
-3. Run this importer for each new transcript.
-4. Write raw source notes into Obsidian and selected internal memos into the ZeroDrift Wiki.
+2. Replace Lark/Feishu polling with webhooks when the deployed app has the required permissions.
+3. Trigger `google-import` or `lark-import` directly from each platform event.
+4. Keep the local inbox fallback for manually exported transcripts and audio recordings.
 
 ## Security Notes
 

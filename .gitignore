@@ -7,6 +7,8 @@ __pycache__/
 state/*.json
 state/*.db
 output/
+inbox/
+logs/
 
 # Local macOS/editor noise
 .DS_Store

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import urllib.error
 import urllib.parse
@@ -31,6 +32,8 @@ DEFAULT_INTERNAL_DIR = (
 )
 DEFAULT_GOOGLE_TOKEN = STATE_DIR / "google-meet-token.json"
 DEFAULT_GOOGLE_CLIENT_SECRET = STATE_DIR / "google-oauth-client.json"
+DEFAULT_DAEMON_STATE = STATE_DIR / "daemon-state.json"
+DEFAULT_INBOX_DIR = ROOT / "inbox"
 
 GOOGLE_MEET_SCOPES = ["https://www.googleapis.com/auth/meetings.space.readonly"]
 
@@ -84,12 +87,28 @@ class IngestError(Exception):
     pass
 
 
+class SkipSource(Exception):
+    pass
+
+
 def now_local() -> dt.datetime:
     return dt.datetime.now().astimezone()
 
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise IngestError(f"Could not find a unique output path for {path}")
 
 
 def slugify(value: str, fallback: str = "meeting") -> str:
@@ -281,12 +300,14 @@ def write_note(
         ai_brief=ai_brief,
         extra=extra,
     )
-    out_path = sources_dir / filename
+    out_path = unique_path(sources_dir / filename)
     out_path.write_text(note, encoding="utf-8")
 
     if internal_dir:
         ensure_dir(internal_dir)
-        internal_path = internal_dir / f"{date_prefix}-{platform}-{slugify(title)}.md"
+        internal_path = unique_path(
+            internal_dir / f"{date_prefix}-{platform}-{slugify(title)}.md"
+        )
         internal_path.write_text(note, encoding="utf-8")
 
     return out_path
@@ -362,7 +383,7 @@ Transcript:
     raise IngestError(f"Could not parse OpenAI summary response: {json.dumps(data)[:1000]}")
 
 
-def get_google_creds(token_path: Path, client_secret_path: Path):
+def get_google_creds(token_path: Path, client_secret_path: Path, *, interactive: bool = True):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -379,6 +400,10 @@ def get_google_creds(token_path: Path, client_secret_path: Path):
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     if not creds or not creds.valid:
+        if not interactive:
+            raise SkipSource(
+                f"Google token is missing or invalid at {token_path}; run google-import once interactively."
+            )
         if not client_secret_path.exists():
             raise IngestError(
                 f"Missing Google OAuth client secret at {client_secret_path}. "
@@ -597,23 +622,394 @@ def import_lark(args: argparse.Namespace) -> Path:
 
 def search_lark(args: argparse.Namespace) -> None:
     bearer = lark_access_token(args.region, args.access_token)
-    query = {"query": args.query, "sorter": "create_time_desc"}
-    if args.start_time or args.end_time:
+    data = lark_search_minutes(
+        region=args.region,
+        bearer=bearer,
+        query=args.query,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        page_size=args.page_size,
+    )
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def lark_search_minutes(
+    *,
+    region: str,
+    bearer: str,
+    query: str,
+    start_time: str = "",
+    end_time: str = "",
+    page_size: int = 10,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"query": query, "sorter": "create_time_desc"}
+    if start_time or end_time:
         create_time: Dict[str, str] = {}
-        if args.start_time:
-            create_time["start_time"] = args.start_time
-        if args.end_time:
-            create_time["end_time"] = args.end_time
-        query["filter"] = {"create_time": create_time}
-    params = urllib.parse.urlencode({"page_size": args.page_size, "user_id_type": "open_id"})
-    url = f"{lark_base(args.region)}/open-apis/minutes/v1/minutes/search?{params}"
-    data = http_json(
+        if start_time:
+            create_time["start_time"] = start_time
+        if end_time:
+            create_time["end_time"] = end_time
+        body["filter"] = {"create_time": create_time}
+    params = urllib.parse.urlencode({"page_size": page_size, "user_id_type": "open_id"})
+    url = f"{lark_base(region)}/open-apis/minutes/v1/minutes/search?{params}"
+    return http_json(
         "POST",
         url,
         headers={"Authorization": f"Bearer {bearer}"},
-        body=query,
+        body=body,
     )
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {
+            "seen_lark_minutes": [],
+            "seen_google_transcripts": [],
+            "seen_inbox_files": {},
+            "runs": [],
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IngestError(f"State file is not valid JSON: {path}") from exc
+    data.setdefault("seen_lark_minutes", [])
+    data.setdefault("seen_google_transcripts", [])
+    data.setdefault("seen_inbox_files", {})
+    data.setdefault("runs", [])
+    return data
+
+
+def save_state(path: Path, state: Dict[str, Any]) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def remember(state: Dict[str, Any], key: str, value: str) -> None:
+    seen = state.setdefault(key, [])
+    if value not in seen:
+        seen.append(value)
+
+
+def is_seen(state: Dict[str, Any], key: str, value: str) -> bool:
+    return value in state.setdefault(key, [])
+
+
+def extract_lark_minutes(data: Any) -> List[Dict[str, str]]:
+    minutes: Dict[str, Dict[str, str]] = {}
+
+    def add(token: str, title: str = "", url: str = "") -> None:
+        token = token.strip()
+        if not token:
+            return
+        try:
+            token = parse_minute_token(token)
+        except IngestError:
+            return
+        current = minutes.setdefault(token, {"token": token, "title": "", "url": ""})
+        if title and not current["title"]:
+            current["title"] = str(title)
+        if url and not current["url"]:
+            current["url"] = str(url)
+
+    def walk(value: Any, parent: Optional[Dict[str, Any]] = None) -> None:
+        if isinstance(value, dict):
+            title = str(
+                value.get("title")
+                or value.get("topic")
+                or value.get("meeting_title")
+                or value.get("name")
+                or ""
+            )
+            url = str(value.get("url") or value.get("share_url") or value.get("minutes_url") or "")
+            for key in ("minute_token", "minutes_token", "object_token", "token"):
+                if key in value:
+                    add(str(value[key]), title=title, url=url)
+            for raw in value.values():
+                walk(raw, value)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, parent)
+        elif isinstance(value, str):
+            match = re.search(r"/minutes/([A-Za-z0-9_-]{24})", value)
+            if match:
+                parent_title = ""
+                if parent:
+                    parent_title = str(
+                        parent.get("title")
+                        or parent.get("topic")
+                        or parent.get("meeting_title")
+                        or parent.get("name")
+                        or ""
+                    )
+                add(match.group(1), title=parent_title, url=value)
+
+    walk(data)
+    return list(minutes.values())
+
+
+def import_lark_token(
+    *,
+    token: str,
+    region: str,
+    title: str,
+    source_url: str,
+    sources_dir: Path,
+    internal_dir: Path,
+    write_internal: bool,
+    summarize: bool,
+    summary_model: str,
+    dry_run: bool,
+) -> Optional[Path]:
+    if dry_run:
+        print(f"[dry-run] would import {region} Minutes transcript {token} ({title or 'untitled'})")
+        return None
+    args = argparse.Namespace(
+        minute=token,
+        region=region,
+        access_token="",
+        need_speaker=True,
+        need_timestamp=True,
+        file_format="txt",
+        title=title,
+        source_url=source_url,
+        sources_dir=sources_dir,
+        internal_dir=internal_dir,
+        write_internal=write_internal,
+        summarize=summarize,
+        summary_model=summary_model,
+    )
+    return import_lark(args)
+
+
+def auto_import_lark(args: argparse.Namespace, state: Dict[str, Any]) -> int:
+    try:
+        bearer = lark_access_token(args.lark_region, "")
+    except IngestError as exc:
+        print(f"[auto] skip Lark/Feishu: {exc}")
+        return 0
+
+    end = now_local()
+    start = end - dt.timedelta(hours=args.lookback_hours)
+    data = lark_search_minutes(
+        region=args.lark_region,
+        bearer=bearer,
+        query=args.lark_query,
+        start_time=start.isoformat(),
+        end_time=end.isoformat(),
+        page_size=args.page_size,
+    )
+    if data.get("code") not in (0, None):
+        raise IngestError(f"Lark search failed: {data}")
+    minutes = extract_lark_minutes(data)
+    imported = 0
+    for minute in minutes:
+        token = minute["token"]
+        if is_seen(state, "seen_lark_minutes", token):
+            continue
+        try:
+            output = import_lark_token(
+                token=token,
+                region=args.lark_region,
+                title=minute.get("title", ""),
+                source_url=minute.get("url", ""),
+                sources_dir=args.sources_dir,
+                internal_dir=args.internal_dir,
+                write_internal=args.write_internal,
+                summarize=args.summarize,
+                summary_model=args.summary_model,
+                dry_run=args.dry_run,
+            )
+        except IngestError as exc:
+            print(f"[auto] Lark import failed for {token}: {exc}")
+            continue
+        remember(state, "seen_lark_minutes", token)
+        imported += 1
+        print(f"[auto] imported Lark/Feishu minute {token}: {output or 'dry-run'}")
+    return imported
+
+
+def auto_import_google(args: argparse.Namespace, state: Dict[str, Any]) -> int:
+    if not args.google:
+        return 0
+    try:
+        from googleapiclient.discovery import build
+    except ImportError:
+        print("[auto] skip Google Meet: google-api-python-client is not installed")
+        return 0
+    try:
+        creds = get_google_creds(args.token_path, args.client_secret, interactive=False)
+    except (IngestError, SkipSource) as exc:
+        print(f"[auto] skip Google Meet: {exc}")
+        return 0
+
+    service = build("meet", "v2", credentials=creds)
+    kwargs: Dict[str, Any] = {"pageSize": args.google_page_size}
+    if args.google_filter:
+        kwargs["filter"] = args.google_filter
+    try:
+        response = service.conferenceRecords().list(**kwargs).execute()
+    except Exception as exc:
+        print(f"[auto] skip Google Meet: conferenceRecords.list failed: {exc}")
+        return 0
+
+    imported = 0
+    for record in response.get("conferenceRecords", []):
+        record_name = record.get("name", "")
+        if not record_name:
+            continue
+        try:
+            transcripts_response = (
+                service.conferenceRecords()
+                .transcripts()
+                .list(parent=record_name, pageSize=100)
+                .execute()
+            )
+        except Exception as exc:
+            print(f"[auto] Google transcript list failed for {record_name}: {exc}")
+            continue
+        for transcript in transcripts_response.get("transcripts", []):
+            transcript_name = transcript.get("name", "")
+            if not transcript_name or is_seen(state, "seen_google_transcripts", transcript_name):
+                continue
+            try:
+                entries = list_google_entries(service, transcript_name)
+                if not entries:
+                    continue
+                transcript_text = google_entries_to_text(entries)
+                started = record.get("startTime") or ""
+                title_date = seconds_from_rfc3339(started) or now_local().strftime("%Y-%m-%d")
+                title = f"Google Meet transcript {title_date}"
+                brief = ""
+                if args.summarize:
+                    brief = generate_openai_brief(
+                        transcript_text, model=args.summary_model, title=title
+                    )
+                if args.dry_run:
+                    print(f"[dry-run] would import Google Meet transcript {transcript_name}")
+                    output = None
+                else:
+                    output = write_note(
+                        title=title,
+                        platform="google-meet",
+                        transcript_text=transcript_text,
+                        source_url="",
+                        source_id=transcript_name,
+                        transcript_source="google-meet-api-auto",
+                        sources_dir=args.sources_dir,
+                        internal_dir=args.internal_dir if args.write_internal else None,
+                        ai_brief=brief,
+                        extra={"google_conference_record": record_name},
+                    )
+            except Exception as exc:
+                print(f"[auto] Google import failed for {transcript_name}: {exc}")
+                continue
+            remember(state, "seen_google_transcripts", transcript_name)
+            imported += 1
+            print(f"[auto] imported Google transcript {transcript_name}: {output or 'dry-run'}")
+    return imported
+
+
+TEXT_EXTENSIONS = {".txt", ".md", ".vtt", ".srt", ".tsv"}
+AUDIO_EXTENSIONS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
+
+
+def inbox_file_key(path: Path) -> str:
+    stat = path.stat()
+    return f"{path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}"
+
+
+def process_inbox(args: argparse.Namespace, state: Dict[str, Any]) -> int:
+    inbox_dir = args.inbox_dir.expanduser()
+    ensure_dir(inbox_dir)
+    files = sorted(path for path in inbox_dir.rglob("*") if path.is_file())
+    processed = 0
+    seen_files = state.setdefault("seen_inbox_files", {})
+    for path in files:
+        suffix = path.suffix.lower()
+        if suffix not in TEXT_EXTENSIONS and suffix not in AUDIO_EXTENSIONS:
+            continue
+        key = str(path.resolve())
+        current = inbox_file_key(path)
+        if seen_files.get(key) == current:
+            continue
+        if args.dry_run:
+            print(f"[dry-run] would process inbox file {path}")
+            seen_files[key] = current
+            processed += 1
+            continue
+        try:
+            if suffix in TEXT_EXTENSIONS:
+                file_args = argparse.Namespace(
+                    input=path,
+                    title=path.stem,
+                    platform="inbox",
+                    source_url="",
+                    source_id=str(path),
+                    transcript_source="inbox-file",
+                    sources_dir=args.sources_dir,
+                    internal_dir=args.internal_dir,
+                    write_internal=args.write_internal,
+                    summarize=args.summarize,
+                    summary_model=args.summary_model,
+                )
+                output = import_file(file_args)
+            else:
+                audio_args = argparse.Namespace(
+                    audio=path,
+                    engine=args.audio_engine,
+                    out_dir=ROOT / "output" / "inbox",
+                    language=args.language,
+                    mlx_model=args.mlx_model,
+                    openai_transcribe_model=args.openai_transcribe_model,
+                    openai_prompt=args.openai_prompt,
+                    title=path.stem,
+                    source_url="",
+                    sources_dir=args.sources_dir,
+                    internal_dir=args.internal_dir,
+                    write_internal=args.write_internal,
+                    summarize=args.summarize,
+                    summary_model=args.summary_model,
+                    platform="local-audio",
+                    source_id=str(path),
+                    transcript_source="",
+                )
+                output = transcribe_audio(audio_args)
+        except Exception as exc:
+            print(f"[auto] inbox processing failed for {path}: {exc}")
+            continue
+        seen_files[key] = current
+        processed += 1
+        print(f"[auto] processed inbox file {path}: {output}")
+    return processed
+
+
+def daemon_run(args: argparse.Namespace) -> None:
+    state = load_state(args.state_path)
+    while True:
+        run_started = now_local().isoformat()
+        imported = 0
+        try:
+            if args.process_lark:
+                imported += auto_import_lark(args, state)
+            if args.google:
+                imported += auto_import_google(args, state)
+            if args.process_inbox:
+                imported += process_inbox(args, state)
+        finally:
+            state.setdefault("runs", []).append(
+                {
+                    "started_at": run_started,
+                    "finished_at": now_local().isoformat(),
+                    "imported": imported,
+                    "dry_run": args.dry_run,
+                }
+            )
+            state["runs"] = state["runs"][-50:]
+            save_state(args.state_path, state)
+        print(f"[auto] run complete: imported={imported}")
+        if args.once:
+            return
+        time.sleep(args.interval_seconds)
 
 
 def import_file(args: argparse.Namespace) -> Path:
@@ -788,6 +1184,48 @@ def build_parser() -> argparse.ArgumentParser:
     audio.add_argument("--transcript-source", default="")
     audio.set_defaults(func=transcribe_audio)
 
+    daemon = sub.add_parser(
+        "daemon-run",
+        help="Automatically poll transcript sources and process the local inbox.",
+    )
+    add_common_note_args(daemon)
+    daemon.add_argument("--state-path", type=Path, default=DEFAULT_DAEMON_STATE)
+    daemon.add_argument("--once", action="store_true", help="Run one cycle and exit.")
+    daemon.add_argument("--interval-seconds", type=int, default=300)
+    daemon.add_argument("--dry-run", action="store_true")
+    daemon.add_argument("--process-lark", action="store_true", default=True)
+    daemon.add_argument("--no-lark", dest="process_lark", action="store_false")
+    daemon.add_argument("--lark-region", choices=["feishu", "lark"], default=os.environ.get("LARK_REGION", "feishu"))
+    daemon.add_argument("--lark-query", default=os.environ.get("LARK_QUERY", ""))
+    daemon.add_argument("--lookback-hours", type=int, default=int(os.environ.get("LOOKBACK_HOURS", "72")))
+    daemon.add_argument("--page-size", type=int, default=int(os.environ.get("LARK_PAGE_SIZE", "20")))
+    daemon.add_argument("--google", action="store_true", default=os.environ.get("GOOGLE_AUTO", "1") != "0")
+    daemon.add_argument("--no-google", dest="google", action="store_false")
+    daemon.add_argument("--google-page-size", type=int, default=int(os.environ.get("GOOGLE_PAGE_SIZE", "20")))
+    daemon.add_argument("--google-filter", default=os.environ.get("GOOGLE_FILTER", ""))
+    daemon.add_argument("--client-secret", type=Path, default=DEFAULT_GOOGLE_CLIENT_SECRET)
+    daemon.add_argument("--token-path", type=Path, default=DEFAULT_GOOGLE_TOKEN)
+    daemon.add_argument("--process-inbox", action="store_true", default=True)
+    daemon.add_argument("--no-inbox", dest="process_inbox", action="store_false")
+    daemon.add_argument("--inbox-dir", type=Path, default=Path(os.environ.get("MEETING_INBOX_DIR", str(DEFAULT_INBOX_DIR))))
+    daemon.add_argument("--audio-engine", choices=["mlx", "openai"], default=os.environ.get("AUDIO_ENGINE", "mlx"))
+    daemon.add_argument("--language", default=os.environ.get("TRANSCRIPT_LANGUAGE", ""))
+    daemon.add_argument("--mlx-model", default=os.environ.get("MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo"))
+    daemon.add_argument("--openai-transcribe-model", default=os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"))
+    daemon.add_argument(
+        "--openai-prompt",
+        default=os.environ.get(
+            "OPENAI_TRANSCRIBE_PROMPT",
+            (
+                "This is a crypto security meeting. Preserve names like ZeroDrift, "
+                "Security World Model, EVM, Solana, Move, Sui, DeFi, CLMM, oracle, "
+                "MEV, governance, multisig, timelock, vault, TVL, proof-of-exploit, "
+                "Cantina, Immunefi, Code4rena, Trail of Bits, Certora, OtterSec."
+            ),
+        ),
+    )
+    daemon.set_defaults(func=daemon_run)
+
     return parser
 
 
@@ -805,6 +1243,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.internal_dir = Path(env_internal).expanduser()
     if hasattr(args, "summary_model") and args.summary_model == "gpt-4o":
         args.summary_model = os.environ.get("MEETING_NOTES_MODEL", args.summary_model)
+    if getattr(args, "command", "") == "daemon-run":
+        if "LARK_REGION" in os.environ:
+            args.lark_region = os.environ["LARK_REGION"]
+        if "LARK_QUERY" in os.environ:
+            args.lark_query = os.environ["LARK_QUERY"]
+        if "LOOKBACK_HOURS" in os.environ:
+            args.lookback_hours = int(os.environ["LOOKBACK_HOURS"])
+        if "LARK_PAGE_SIZE" in os.environ:
+            args.page_size = int(os.environ["LARK_PAGE_SIZE"])
+        if "GOOGLE_AUTO" in os.environ:
+            args.google = os.environ["GOOGLE_AUTO"] != "0"
+        if "GOOGLE_PAGE_SIZE" in os.environ:
+            args.google_page_size = int(os.environ["GOOGLE_PAGE_SIZE"])
+        if "GOOGLE_FILTER" in os.environ:
+            args.google_filter = os.environ["GOOGLE_FILTER"]
+        if "MEETING_INBOX_DIR" in os.environ:
+            args.inbox_dir = Path(os.environ["MEETING_INBOX_DIR"]).expanduser()
+        if "AUDIO_ENGINE" in os.environ:
+            args.audio_engine = os.environ["AUDIO_ENGINE"]
+        if "TRANSCRIPT_LANGUAGE" in os.environ:
+            args.language = os.environ["TRANSCRIPT_LANGUAGE"]
+        if "MLX_WHISPER_MODEL" in os.environ:
+            args.mlx_model = os.environ["MLX_WHISPER_MODEL"]
+        if "OPENAI_TRANSCRIBE_MODEL" in os.environ:
+            args.openai_transcribe_model = os.environ["OPENAI_TRANSCRIBE_MODEL"]
+        if "OPENAI_TRANSCRIBE_PROMPT" in os.environ:
+            args.openai_prompt = os.environ["OPENAI_TRANSCRIBE_PROMPT"]
     try:
         result = args.func(args)
     except subprocess.CalledProcessError as exc:
