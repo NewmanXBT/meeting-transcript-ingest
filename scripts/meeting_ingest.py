@@ -34,6 +34,7 @@ DEFAULT_GOOGLE_TOKEN = STATE_DIR / "google-meet-token.json"
 DEFAULT_GOOGLE_CLIENT_SECRET = STATE_DIR / "google-oauth-client.json"
 DEFAULT_DAEMON_STATE = STATE_DIR / "daemon-state.json"
 DEFAULT_INBOX_DIR = ROOT / "inbox"
+DEFAULT_LARK_CLI = "lark-cli"
 
 GOOGLE_MEET_SCOPES = ["https://www.googleapis.com/auth/meetings.space.readonly"]
 
@@ -189,6 +190,76 @@ def http_bytes(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise IngestError(f"HTTP {exc.code} for {url}: {detail[:1200]}") from exc
+
+
+def lark_cli_executable() -> Optional[str]:
+    configured = os.environ.get("LARK_CLI") or DEFAULT_LARK_CLI
+    if "/" in configured:
+        return configured if Path(configured).exists() else None
+    return shutil.which(configured)
+
+
+def lark_cli_base_args() -> List[str]:
+    exe = lark_cli_executable()
+    if not exe:
+        raise IngestError("lark-cli is not installed or not in PATH.")
+    args = [exe]
+    profile = os.environ.get("LARK_CLI_PROFILE", "")
+    if profile:
+        args.extend(["--profile", profile])
+    return args
+
+
+def lark_identity() -> str:
+    return os.environ.get("LARK_CLI_AS", "user")
+
+
+def should_use_lark_cli() -> bool:
+    backend = os.environ.get("LARK_BACKEND", "auto").lower()
+    if backend == "api":
+        return False
+    if backend == "cli":
+        return True
+    return lark_cli_executable() is not None
+
+
+def run_lark_cli_json(args: List[str], *, timeout: int = 120) -> Dict[str, Any]:
+    completed = subprocess.run(
+        lark_cli_base_args() + args,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise IngestError(f"lark-cli failed: {detail[:1200]}")
+    output = completed.stdout.strip()
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise IngestError(f"lark-cli returned non-JSON output: {output[:1000]}") from exc
+
+
+def run_lark_cli_file(args: List[str], output_path: Path, *, timeout: int = 180) -> bytes:
+    completed = subprocess.run(
+        lark_cli_base_args() + args,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise IngestError(f"lark-cli failed: {detail[:1200]}")
+    if output_path.exists():
+        return output_path.read_bytes()
+    stdout = completed.stdout
+    if stdout:
+        return stdout.encode("utf-8")
+    raise IngestError(f"lark-cli did not write expected output file: {output_path}")
 
 
 def seconds_from_rfc3339(value: Optional[str]) -> str:
@@ -556,6 +627,28 @@ def parse_minute_token(value: str) -> str:
 
 
 def lark_get_minute_info(region: str, token: str, bearer: str) -> Dict[str, Any]:
+    if should_use_lark_cli():
+        try:
+            data = run_lark_cli_json(
+                [
+                    "minutes",
+                    "minutes",
+                    "get",
+                    "--as",
+                    lark_identity(),
+                    "--format",
+                    "json",
+                    "--params",
+                    json.dumps({"minute_token": token, "user_id_type": "open_id"}),
+                ]
+            )
+            if data.get("ok") is False:
+                return {}
+            return data.get("data", {}).get("minute", {}) or data.get("minute", {}) or data.get("data", {}) or {}
+        except IngestError:
+            if os.environ.get("LARK_BACKEND", "auto").lower() == "cli":
+                raise
+            return {}
     url = f"{lark_base(region)}/open-apis/minutes/v1/minutes/{token}"
     try:
         data = http_json(
@@ -572,7 +665,6 @@ def lark_get_minute_info(region: str, token: str, bearer: str) -> Dict[str, Any]
 
 def import_lark(args: argparse.Namespace) -> Path:
     token = parse_minute_token(args.minute)
-    bearer = lark_access_token(args.region, args.access_token)
     params = urllib.parse.urlencode(
         {
             "need_speaker": "true" if args.need_speaker else "false",
@@ -580,18 +672,52 @@ def import_lark(args: argparse.Namespace) -> Path:
             "file_format": args.file_format,
         }
     )
-    url = (
-        f"{lark_base(args.region)}/open-apis/minutes/v1/minutes/"
-        f"{token}/transcript?{params}"
-    )
-    raw = http_bytes(
-        "GET",
-        url,
-        headers={
-            "Authorization": f"Bearer {bearer}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-    )
+    bearer = ""
+    raw: bytes
+    if should_use_lark_cli():
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                output_path = Path(tmp_dir) / f"{token}.{args.file_format}"
+                raw = run_lark_cli_file(
+                    [
+                        "api",
+                        "GET",
+                        f"/open-apis/minutes/v1/minutes/{token}/transcript",
+                        "--as",
+                        lark_identity(),
+                        "--params",
+                        json.dumps(
+                            {
+                                "need_speaker": "true" if args.need_speaker else "false",
+                                "need_timestamp": "true" if args.need_timestamp else "false",
+                                "file_format": args.file_format,
+                            }
+                        ),
+                        "--output",
+                        str(output_path),
+                    ],
+                    output_path,
+                )
+        except IngestError:
+            if os.environ.get("LARK_BACKEND", "auto").lower() == "cli":
+                raise
+            raw = b""
+    else:
+        raw = b""
+    if not raw:
+        bearer = lark_access_token(args.region, args.access_token)
+        url = (
+            f"{lark_base(args.region)}/open-apis/minutes/v1/minutes/"
+            f"{token}/transcript?{params}"
+        )
+        raw = http_bytes(
+            "GET",
+            url,
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
     transcript_text = raw.decode("utf-8", errors="replace")
     info = lark_get_minute_info(args.region, token, bearer)
     title = (
@@ -621,16 +747,60 @@ def import_lark(args: argparse.Namespace) -> Path:
 
 
 def search_lark(args: argparse.Namespace) -> None:
-    bearer = lark_access_token(args.region, args.access_token)
-    data = lark_search_minutes(
-        region=args.region,
-        bearer=bearer,
-        query=args.query,
-        start_time=args.start_time,
-        end_time=args.end_time,
-        page_size=args.page_size,
-    )
+    if should_use_lark_cli():
+        try:
+            data = lark_cli_search_minutes(
+                query=args.query,
+                start_time=args.start_time,
+                end_time=args.end_time,
+                page_size=args.page_size,
+            )
+        except IngestError:
+            if os.environ.get("LARK_BACKEND", "auto").lower() == "cli":
+                raise
+            data = {}
+    else:
+        data = {}
+    if not data:
+        bearer = lark_access_token(args.region, args.access_token)
+        data = lark_search_minutes(
+            region=args.region,
+            bearer=bearer,
+            query=args.query,
+            start_time=args.start_time,
+            end_time=args.end_time,
+            page_size=args.page_size,
+        )
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def lark_cli_search_minutes(
+    *,
+    query: str,
+    start_time: str = "",
+    end_time: str = "",
+    page_size: int = 10,
+) -> Dict[str, Any]:
+    command = [
+        "minutes",
+        "+search",
+        "--as",
+        lark_identity(),
+        "--format",
+        "json",
+        "--page-size",
+        str(page_size),
+    ]
+    if query:
+        command.extend(["--query", query])
+    if start_time:
+        command.extend(["--start", start_time])
+    if end_time:
+        command.extend(["--end", end_time])
+    data = run_lark_cli_json(command)
+    if data.get("ok") is False:
+        raise IngestError(f"lark-cli search failed: {data}")
+    return data
 
 
 def lark_search_minutes(
@@ -782,22 +952,42 @@ def import_lark_token(
 
 
 def auto_import_lark(args: argparse.Namespace, state: Dict[str, Any]) -> int:
+    end = now_local()
+    start = end - dt.timedelta(hours=args.lookback_hours)
     try:
-        bearer = lark_access_token(args.lark_region, "")
+        if should_use_lark_cli():
+            try:
+                data = lark_cli_search_minutes(
+                    query=args.lark_query,
+                    start_time=start.isoformat(),
+                    end_time=end.isoformat(),
+                    page_size=args.page_size,
+                )
+            except IngestError:
+                if os.environ.get("LARK_BACKEND", "auto").lower() == "cli":
+                    raise
+                bearer = lark_access_token(args.lark_region, "")
+                data = lark_search_minutes(
+                    region=args.lark_region,
+                    bearer=bearer,
+                    query=args.lark_query,
+                    start_time=start.isoformat(),
+                    end_time=end.isoformat(),
+                    page_size=args.page_size,
+                )
+        else:
+            bearer = lark_access_token(args.lark_region, "")
+            data = lark_search_minutes(
+                region=args.lark_region,
+                bearer=bearer,
+                query=args.lark_query,
+                start_time=start.isoformat(),
+                end_time=end.isoformat(),
+                page_size=args.page_size,
+            )
     except IngestError as exc:
         print(f"[auto] skip Lark/Feishu: {exc}")
         return 0
-
-    end = now_local()
-    start = end - dt.timedelta(hours=args.lookback_hours)
-    data = lark_search_minutes(
-        region=args.lark_region,
-        bearer=bearer,
-        query=args.lark_query,
-        start_time=start.isoformat(),
-        end_time=end.isoformat(),
-        page_size=args.page_size,
-    )
     if data.get("code") not in (0, None):
         raise IngestError(f"Lark search failed: {data}")
     minutes = extract_lark_minutes(data)

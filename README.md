@@ -81,6 +81,8 @@ python scripts/meeting_ingest.py google-import \
 
 ### Lark / Feishu
 
+By default, the importer prefers an installed `lark-cli` and falls back to direct OpenAPI environment tokens. This lets the automatic service reuse your existing Lark CLI profile without storing a Lark token in `.env`.
+
 For a single Minutes transcript:
 
 ```bash
@@ -109,6 +111,8 @@ python scripts/meeting_ingest.py lark-search \
 ```
 
 Search requires a Lark/Feishu user access token with the Minutes search scope. Export can use a user or tenant token if the app has access to the Minutes file.
+
+Use `LARK_BACKEND=cli` to require `lark-cli`, or `LARK_BACKEND=api` to force direct OpenAPI tokens.
 
 ## Local Audio Fallback
 
@@ -231,6 +235,10 @@ python scripts/meeting_ingest.py daemon-run --once
 Useful `.env` settings:
 
 ```bash
+LARK_BACKEND=auto
+LARK_CLI=lark-cli
+LARK_CLI_PROFILE=
+LARK_CLI_AS=user
 LARK_REGION=feishu
 LARK_QUERY=
 LOOKBACK_HOURS=72
