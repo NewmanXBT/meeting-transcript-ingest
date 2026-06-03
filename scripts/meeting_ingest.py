@@ -134,6 +134,13 @@ def load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def yaml_scalar(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -391,11 +398,7 @@ def write_note(
     return out_path
 
 
-def generate_openai_brief(transcript_text: str, *, model: str, title: str) -> str:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise IngestError("OPENAI_API_KEY is not set; cannot generate AI summary.")
-
+def summary_prompt(transcript_text: str, *, title: str) -> Tuple[str, str]:
     trimmed = transcript_text.strip()
     max_chars = int(os.environ.get("MEETING_SUMMARY_MAX_CHARS", "120000"))
     if len(trimmed) > max_chars:
@@ -423,6 +426,15 @@ Produce a concise but useful note with these sections:
 Transcript:
 {trimmed}
 """
+    return system, user
+
+
+def generate_openai_brief(transcript_text: str, *, model: str, title: str) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise IngestError("OPENAI_API_KEY is not set; cannot generate AI summary.")
+
+    system, user = summary_prompt(transcript_text, title=title)
     payload = {
         "model": model,
         "input": [
@@ -446,6 +458,8 @@ Transcript:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise IngestError(f"OpenAI summary failed: HTTP {exc.code}: {detail[:1200]}") from exc
+    except urllib.error.URLError as exc:
+        raise IngestError(f"OpenAI summary failed: {exc}") from exc
 
     if data.get("output_text"):
         return str(data["output_text"]).strip()
@@ -459,6 +473,109 @@ Transcript:
     if pieces:
         return "\n".join(pieces).strip()
     raise IngestError(f"Could not parse OpenAI summary response: {json.dumps(data)[:1000]}")
+
+
+def generate_bedrock_brief(transcript_text: str, *, model: str, title: str) -> str:
+    aws = shutil.which("aws")
+    if not aws:
+        raise IngestError("AWS CLI is not installed; cannot generate Bedrock summary.")
+
+    system, user = summary_prompt(transcript_text, title=title)
+    region = (
+        os.environ.get("MEETING_BEDROCK_REGION")
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
+    payload = {
+        "modelId": model,
+        "system": [{"text": system}],
+        "messages": [
+            {"role": "user", "content": [{"text": user}]},
+        ],
+        "inferenceConfig": {
+            "maxTokens": int(os.environ.get("MEETING_SUMMARY_MAX_OUTPUT_TOKENS", "2400")),
+            "temperature": float(os.environ.get("MEETING_SUMMARY_TEMPERATURE", "0.2")),
+        },
+    }
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tmp:
+        json.dump(payload, tmp)
+        tmp_path = tmp.name
+    try:
+        env = os.environ.copy()
+        env.setdefault("AWS_PAGER", "")
+        completed = subprocess.run(
+            [
+                aws,
+                "bedrock-runtime",
+                "converse",
+                "--region",
+                region,
+                "--cli-input-json",
+                f"file://{tmp_path}",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=int(os.environ.get("MEETING_BEDROCK_TIMEOUT_SECONDS", "300")),
+            env=env,
+        )
+    finally:
+        try:
+            Path(tmp_path).unlink()
+        except FileNotFoundError:
+            pass
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise IngestError(f"Bedrock summary failed: {detail[:1200]}")
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise IngestError(f"Could not parse Bedrock summary response: {completed.stdout[:1000]}") from exc
+
+    pieces: List[str] = []
+    message = data.get("output", {}).get("message", {})
+    for content in message.get("content", []):
+        text = content.get("text")
+        if text:
+            pieces.append(text)
+    out = "\n".join(pieces).strip()
+    if out:
+        return out
+    raise IngestError(f"Could not parse Bedrock summary response: {json.dumps(data)[:1000]}")
+
+
+def summary_backend() -> str:
+    return os.environ.get("MEETING_SUMMARY_BACKEND", "openai").strip().lower()
+
+
+def summary_backend_available(backend: str) -> bool:
+    if backend == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY"))
+    if backend == "bedrock":
+        return bool(shutil.which("aws"))
+    return False
+
+
+def generate_meeting_brief(transcript_text: str, *, model: str, title: str) -> str:
+    backend = summary_backend()
+    if backend == "openai":
+        return generate_openai_brief(transcript_text, model=model, title=title)
+    if backend == "bedrock":
+        return generate_bedrock_brief(transcript_text, model=model, title=title)
+    raise IngestError(f"Unknown meeting summary backend: {backend}")
+
+
+def is_summary_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "OpenAI summary failed" in message
+        or "OPENAI_API_KEY is not set" in message
+        or "Bedrock summary failed" in message
+        or "AWS CLI is not installed" in message
+        or "Unknown meeting summary backend" in message
+    )
 
 
 def get_google_creds(token_path: Path, client_secret_path: Path, *, interactive: bool = True):
@@ -567,7 +684,7 @@ def import_google(args: argparse.Namespace) -> Path:
     title = args.title or f"Google Meet transcript {transcript_name.split('/')[-1]}"
     brief = ""
     if args.summarize:
-        brief = generate_openai_brief(
+        brief = generate_meeting_brief(
             transcript_text, model=args.summary_model, title=title
         )
     return write_note(
@@ -739,7 +856,7 @@ def import_lark(args: argparse.Namespace) -> Path:
     source_url = args.source_url or info.get("url") or args.minute
     brief = ""
     if args.summarize:
-        brief = generate_openai_brief(
+        brief = generate_meeting_brief(
             transcript_text, model=args.summary_model, title=title
         )
     return write_note(
@@ -1020,8 +1137,30 @@ def auto_import_lark(args: argparse.Namespace, state: Dict[str, Any]) -> int:
                 dry_run=args.dry_run,
             )
         except IngestError as exc:
-            print(f"[auto] Lark import failed for {token}: {exc}")
-            continue
+            if args.summarize and is_summary_error(exc):
+                print(
+                    f"[auto] Lark summary failed for {token}: {exc}; "
+                    "retrying raw transcript import."
+                )
+                try:
+                    output = import_lark_token(
+                        token=token,
+                        region=args.lark_region,
+                        title=minute.get("title", ""),
+                        source_url=minute.get("url", ""),
+                        sources_dir=args.sources_dir,
+                        internal_dir=args.internal_dir,
+                        write_internal=args.write_internal,
+                        summarize=False,
+                        summary_model=args.summary_model,
+                        dry_run=args.dry_run,
+                    )
+                except IngestError as raw_exc:
+                    print(f"[auto] Lark raw import failed for {token}: {raw_exc}")
+                    continue
+            else:
+                print(f"[auto] Lark import failed for {token}: {exc}")
+                continue
         if not args.dry_run:
             remember(state, "seen_lark_minutes", token)
         imported += 1
@@ -1082,9 +1221,18 @@ def auto_import_google(args: argparse.Namespace, state: Dict[str, Any]) -> int:
                 title = f"Google Meet transcript {title_date}"
                 brief = ""
                 if args.summarize:
-                    brief = generate_openai_brief(
-                        transcript_text, model=args.summary_model, title=title
-                    )
+                    try:
+                        brief = generate_meeting_brief(
+                            transcript_text, model=args.summary_model, title=title
+                        )
+                    except IngestError as exc:
+                        if is_summary_error(exc):
+                            print(
+                                f"[auto] Google summary failed for {transcript_name}: {exc}; "
+                                "importing raw transcript."
+                            )
+                        else:
+                            raise
                 if args.dry_run:
                     print(f"[dry-run] would import Google Meet transcript {transcript_name}")
                     output = None
@@ -1218,7 +1366,7 @@ def import_file(args: argparse.Namespace) -> Path:
     title = args.title or args.input.stem
     brief = ""
     if args.summarize:
-        brief = generate_openai_brief(
+        brief = generate_meeting_brief(
             transcript_text, model=args.summary_model, title=title
         )
     return write_note(
@@ -1445,6 +1593,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(args, "summary_model") and args.summary_model == "gpt-4o":
         args.summary_model = os.environ.get("MEETING_NOTES_MODEL", args.summary_model)
     if getattr(args, "command", "") == "daemon-run":
+        if env_flag("MEETING_AUTO_SUMMARIZE"):
+            backend = summary_backend()
+            if summary_backend_available(backend):
+                args.summarize = True
+            else:
+                print(
+                    f"[auto] MEETING_AUTO_SUMMARIZE=1 but {backend} summary backend is unavailable; "
+                    "importing raw transcripts without summaries."
+                )
         if "LARK_REGION" in os.environ:
             args.lark_region = os.environ["LARK_REGION"]
         if "LARK_QUERY" in os.environ:

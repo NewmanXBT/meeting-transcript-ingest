@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ZeroDrift meeting transcript ingest hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=zdmeeting-ingest.service
+
+[Install]
+WantedBy=timers.target

@@ -133,7 +133,7 @@ python scripts/meeting_ingest.py transcribe-audio meeting.m4a \
   --title "Crypto customer call"
 ```
 
-Add `--summarize` when `OPENAI_API_KEY` is available:
+Add `--summarize` when a summary backend is available:
 
 ```bash
 python scripts/meeting_ingest.py lark-import "MINUTES_URL_OR_TOKEN" \
@@ -141,6 +141,16 @@ python scripts/meeting_ingest.py lark-import "MINUTES_URL_OR_TOKEN" \
   --summarize \
   --write-internal
 ```
+
+For automatic imports, set `MEETING_AUTO_SUMMARIZE=1` in `.env`. Local macOS
+runs can use `MEETING_SUMMARY_BACKEND=openai`. EC2 runs should use
+`MEETING_SUMMARY_BACKEND=bedrock` with `MEETING_NOTES_MODEL=deepseek.v3.2`.
+If the configured backend is unavailable, the daemon still imports raw
+transcripts and logs that summaries were skipped.
+
+For launchd, keep `OPENAI_API_KEY` out of `.env` when possible. The bundled
+runner will inject it at runtime from macOS Keychain services named
+`openai_api_key`, `openai-OPENAI_API_KEY`, or `OPENAI_API_KEY`.
 
 `--write-internal` also writes the same note into:
 
@@ -170,6 +180,36 @@ Uninstall:
 ```bash
 ./scripts/uninstall_launchd.sh
 ```
+
+## EC2 Execution
+
+For the AWS resident path, deploy this repository to `/opt/meeting-transcript-ingest`
+on the ZeroDrift EC2 instance and install the bundled systemd timer:
+
+```bash
+sudo /opt/meeting-transcript-ingest/deploy/aws/scripts/install-systemd.sh
+sudo /opt/meeting-transcript-ingest/deploy/aws/scripts/render-meeting-env-from-secret.sh
+sudo systemctl enable --now zdmeeting-ingest.timer
+```
+
+The EC2 environment intentionally uses Bedrock instead of Codex/OpenAI for
+meeting summaries:
+
+```bash
+MEETING_SUMMARY_BACKEND=bedrock
+MEETING_NOTES_MODEL=deepseek.v3.2
+MEETING_BEDROCK_REGION=us-east-1
+```
+
+The render script reads Lark credentials from Secrets Manager secret
+`zerodrift/notify/lark` and writes `/etc/zerodrift-meetings/env`. The service
+writes meeting notes into the EC2 vault root at:
+
+```text
+/var/lib/zerodrift-publisher/ObsidianVault
+```
+
+Use Syncthing to sync that folder with the local Obsidian vault.
 
 Logs are written to:
 
@@ -243,6 +283,10 @@ LARK_REGION=feishu
 LARK_QUERY=
 LOOKBACK_HOURS=72
 LARK_PAGE_SIZE=20
+MEETING_AUTO_SUMMARIZE=0
+MEETING_SUMMARY_BACKEND=openai
+MEETING_NOTES_MODEL=gpt-4o
+MEETING_BEDROCK_REGION=us-east-1
 GOOGLE_AUTO=1
 GOOGLE_PAGE_SIZE=20
 MEETING_INBOX_DIR="./inbox"
