@@ -1,0 +1,22 @@
+[Unit]
+Description=ZeroDrift Obsidian Vault Syncthing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zerodrift
+Group=zerodrift
+Environment=HOME=/var/lib/zerodrift-publisher
+ExecStart=/usr/local/bin/syncthing serve --no-browser --no-restart --no-upgrade --no-port-probing --config=/var/lib/zerodrift-publisher/.config/syncthing --data=/var/lib/zerodrift-publisher/.local/share/syncthing
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodrift-publisher
+
+[Install]
+WantedBy=multi-user.target
