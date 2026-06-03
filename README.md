@@ -184,7 +184,7 @@ Uninstall:
 ## EC2 Execution
 
 For the AWS resident path, deploy this repository to `/opt/meeting-transcript-ingest`
-on the ZeroDrift EC2 instance and install the bundled systemd timer:
+on the ZeroDrift EC2 instance and install the bundled daily systemd timer:
 
 ```bash
 sudo /opt/meeting-transcript-ingest/deploy/aws/scripts/install-systemd.sh
@@ -211,20 +211,20 @@ writes meeting notes into the EC2 vault root at:
 
 Use Syncthing to sync that folder with the local Obsidian vault.
 
-Logs are written to:
+The EC2 timer runs once daily. A meeting-ended webhook or other external signal
+can also trigger an immediate run by starting the oneshot service:
 
-```text
-logs/daemon.out.log
-logs/daemon.err.log
+```bash
+sudo systemctl start zdmeeting-ingest.service
 ```
 
 The automatic runner executes:
 
 ```bash
-python scripts/meeting_ingest.py --env-file .env daemon-run --once
+python scripts/meeting_ingest.py daemon-run --once
 ```
 
-Each hourly cycle does three things:
+Each daily or event-triggered cycle does three things:
 
 1. Searches Lark/Feishu Minutes for recent transcript records and imports unseen transcripts.
 2. Best-effort checks Google Meet transcripts when an existing Google OAuth token is present.

@@ -1,10 +1,10 @@
 [Unit]
-Description=Run ZeroDrift meeting transcript ingest hourly
+Description=Run ZeroDrift meeting transcript ingest daily
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
+OnCalendar=daily
 Persistent=true
+RandomizedDelaySec=15min
 Unit=zdmeeting-ingest.service
 
 [Install]
