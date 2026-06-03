@@ -76,7 +76,9 @@ trap 'rm -f "$tmp"' EXIT
   printf 'MEETING_BEDROCK_REGION=%s\n' "$AWS_REGION"
   printf 'MEETING_SUMMARY_MAX_CHARS=120000\n'
   printf 'MEETING_SUMMARY_MAX_OUTPUT_TOKENS=2400\n'
-  printf 'LARK_BACKEND=api\n'
+  printf 'LARK_BACKEND=cli\n'
+  printf 'LARK_CLI=/usr/bin/lark-cli\n'
+  printf 'LARK_CLI_AS=user\n'
   printf 'LARK_REGION=lark\n'
   printf 'LARK_API_BASE=https://open.larksuite.com\n'
   printf 'LOOKBACK_HOURS=72\n'
