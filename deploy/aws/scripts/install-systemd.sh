@@ -19,6 +19,7 @@ install -d -m 0700 -o zerodrift -g zerodrift /var/lib/zerodrift-publisher/.confi
 install -d -m 0700 -o zerodrift -g zerodrift /var/lib/zerodrift-publisher/.local/share/syncthing
 install -d -m 0750 -o zerodrift -g zerodrift "/var/lib/zerodrift-publisher/ObsidianVault/ZeroDrift Material Library/sources/meetings"
 install -d -m 0750 -o zerodrift -g zerodrift "/var/lib/zerodrift-publisher/ObsidianVault/ZeroDrift Wiki/raw/internal"
+chown -R zerodrift:zerodrift /var/lib/zerodrift-publisher/ObsidianVault
 install -d -m 0750 -o root -g root /etc/zerodrift-meetings
 
 systemctl daemon-reload
