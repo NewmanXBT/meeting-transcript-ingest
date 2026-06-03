@@ -11,7 +11,7 @@ WorkingDirectory=/opt/meeting-transcript-ingest
 EnvironmentFile=/etc/zerodrift-meetings/env
 Environment=HOME=/var/lib/zerodrift-meetings
 Environment=AWS_PAGER=
-ExecStart=/usr/bin/python3 /opt/meeting-transcript-ingest/scripts/meeting_ingest.py --env-file /etc/zerodrift-meetings/env daemon-run --once
+ExecStart=/usr/bin/python3 /opt/meeting-transcript-ingest/scripts/meeting_ingest.py daemon-run --once
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
